@@ -1,7 +1,7 @@
 "use client";
 
 import React, { useEffect, useRef, useState } from "react";
-import { io, Socket } from "socket.io-client";
+import pusher from "@/lib/pusherClient";
 
 interface Message {
   id: string | number;
@@ -24,69 +24,44 @@ export default function Chat() {
   const [unreadCount, setUnreadCount] = useState(0);
   const [lastMessage, setLastMessage] = useState<string>("");
   const [isVisible, setIsVisible] = useState(true);
-  const [lastSeenMessageId, setLastSeenMessageId] = useState<string | number | null>(null); // Track last seen message
-  const socketRef = useRef<Socket | null>(null);
-  const cronStartedRef = useRef(false); // Prevent multiple cron starts
+  const [lastSeenMessageId, setLastSeenMessageId] = useState<string | number | null>(null);
+  const pusherRef = useRef<any>(null);
+  const channelRef = useRef<any>(null);
+  const cronStartedRef = useRef(false);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
-    // Prevent multiple socket connections
-    if (socketRef.current && socketRef.current.connected) {
-      console.log("🔌 Socket already connected, skipping initialization");
-      return;
-    }
-
     // Generate random username only on client side
     setSenderName("User" + Math.floor(Math.random() * 1000));
 
-    console.log("🔧 Initializing socket connection...");
+    console.log("🔧 Initializing Pusher connection...");
 
-    // Try multiple connection approaches
-    const port = window.location.port || "3000";
-    const socketUrl = `http://localhost:${port}`;
-    console.log("🔗 Connecting to:", socketUrl);
+    // Initialize Pusher
+    pusherRef.current = pusher;
 
-    const socket = io(socketUrl, {
-      path: "/api/socket/io",
-      addTrailingSlash: false,
-      transports: ['polling', 'websocket'], // Try both
-      forceNew: false, // Don't force new connection to prevent duplicates
-      reconnection: true,
-      reconnectionAttempts: 5, // Reduced attempts
-      reconnectionDelay: 2000, // Increased delay
-      timeout: 10000
-    });
+    // Subscribe to chat channel
+    const channel = pusherRef.current.subscribe('chat-channel');
+    channelRef.current = channel;
 
-    socketRef.current = socket;
-
-    socket.on("connect", () => {
-      console.log("✅ Connected to socket server with ID:", socket.id);
+    channel.bind('pusher:subscription_succeeded', () => {
+      console.log('✅ Connected to Pusher');
       setIsConnected(true);
-      console.log("🔍 Connection status - Socket connected:", socket.connected);
-      console.log("🔍 Connection status - Socket ID:", socket.id);
     });
 
-    socket.on("disconnect", (reason) => {
-      console.log("❌ Disconnected from socket server. Reason:", reason);
+    channel.bind('pusher:subscription_error', (error: any) => {
+      console.log('🔴 Pusher subscription error:', error);
       setIsConnected(false);
     });
 
-    socket.on("connect_error", (error) => {
-      console.log("🔴 Socket connection error:", error.message);
-      console.log("🔴 Full error:", error);
-      setIsConnected(false);
-      // Removed automatic reconnection attempt to prevent multiple connections
-    });
-
-    socket.on("receiveMessage", (message: Message) => {
-      console.log("📨 Received message:", message);
+    channel.bind('new-message', (message: Message) => {
+      console.log('📨 Received message:', message);
 
       // Check if message already exists to prevent duplicates
       setMessages((prev) => {
         const messageExists = prev.some((msg) => msg.id === message.id);
         if (messageExists) {
-          console.log("⚠️ Duplicate message detected, skipping:", message.id);
+          console.log('⚠️ Duplicate message detected, skipping:', message.id);
           return prev;
         }
 
@@ -129,26 +104,11 @@ export default function Chat() {
       }, 2000);
     });
 
-    socket.on("onlineUsers", (users: string[]) => {
-      console.log("👥 Online users list:", users);
-      setOnlineUsers(users);
-      setOnlineUserCount(users.length);
-    });
-
-    socket.on("usersOnline", (count: number) => {
-      console.log("👥 Online users count:", count);
-      setOnlineUserCount(count);
-    });
-
-    // Force connection attempt
-    socket.connect();
-
     return () => {
-      console.log("🔌 Cleaning up socket connection...");
-      if (socketRef.current) {
-        socketRef.current.removeAllListeners();
-        socketRef.current.disconnect();
-        socketRef.current = null;
+      console.log('🔌 Cleaning up Pusher connection...');
+      if (channelRef.current) {
+        channelRef.current.unbind_all();
+        pusherRef.current.unsubscribe('chat-channel');
       }
     };
   }, []);
@@ -190,76 +150,55 @@ export default function Chat() {
     };
   }, [messages]);
 
-  const sendMessage = () => {
-    if (inputMessage.trim() && socketRef.current) {
-      const messageData = {
-        text: inputMessage.trim(),
-        sender: senderName
-      };
+  const sendMessage = async () => {
+    if (inputMessage.trim()) {
+      try {
+        const response = await fetch('/api/send-message', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({
+            message: inputMessage.trim(),
+            sender: senderName
+          })
+        });
 
-      socketRef.current.emit("sendMessage", messageData);
-      socketRef.current.emit("stopTyping", { sender: senderName });
-      setInputMessage("");
-      inputRef.current?.focus();
+        if (response.ok) {
+          setInputMessage("");
+          inputRef.current?.focus();
+        } else {
+          console.error('Failed to send message');
+        }
+      } catch (error) {
+        console.error('Error sending message:', error);
+      }
     }
   };
 
-  // Start API cron job automatically and poll for messages
+  // Start API cron job automatically
   useEffect(() => {
-    const startCronAndPoll = async () => {
+    const startCron = async () => {
       // Prevent multiple cron starts
       if (cronStartedRef.current) {
-        console.log("🔄 Cron already started, skipping...");
+        console.log('🔄 Cron already started, skipping...');
         return;
       }
 
       try {
-        console.log("🚀 Starting API cron job automatically...");
+        console.log('🚀 Starting API cron job automatically...');
         const response = await fetch('/api/cron', { method: 'POST' });
         const result = await response.json();
-        console.log("✅ API cron started:", result);
+        console.log('✅ API cron started:', result);
         cronStartedRef.current = true;
       } catch (error) {
-        console.error("❌ Failed to start API cron:", error);
+        console.error('❌ Failed to start API cron:', error);
       }
     };
 
     // Start cron job immediately when component mounts
-    startCronAndPoll();
-
-    // Poll for cron messages every 2 seconds
-    const pollInterval = setInterval(async () => {
-      try {
-        const response = await fetch('/api/message');
-        const data = await response.json();
-
-        if (data.message && data.message.includes('Message from cron at')) {
-          // Check if this is a new cron message
-          const messageExists = messages.some(msg =>
-            msg.text === data.message && msg.sender === "Cron Bot"
-          );
-
-          if (!messageExists) {
-            const cronMessage = {
-              id: `cron_${Date.now()}`,
-              text: data.message,
-              sender: "Cron Bot",
-              timestamp: new Date().toISOString(),
-              type: "cron" as const
-            };
-
-            setMessages(prev => [...prev, cronMessage]);
-            setLastMessage(data.message);
-            console.log("📨 Received cron message:", data.message);
-          }
-        }
-      } catch (error) {
-        console.log("Polling error:", error);
-      }
-    }, 2000);
-
-    return () => clearInterval(pollInterval);
-  }, [messages]);
+    startCron();
+  }, []);
 
   const handleKeyPress = (e: React.KeyboardEvent) => {
     if (e.key === "Enter" && !e.shiftKey) {
@@ -270,13 +209,6 @@ export default function Chat() {
 
   const handleInputChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     setInputMessage(e.target.value);
-
-    // Emit typing event with sender data
-    if (e.target.value.trim() && socketRef.current) {
-      socketRef.current.emit("typing", { sender: senderName });
-    } else if (socketRef.current) {
-      socketRef.current.emit("stopTyping", { sender: senderName });
-    }
   };
 
   const formatTime = (timestamp: string) => {
@@ -325,11 +257,11 @@ export default function Chat() {
         </div>
         <div style={{ flex: 1 }}>
           <div style={{ fontWeight: "600", fontSize: "16px" }}>
-            Socket + Cron Chat
+            Pusher + Cron Chat
           </div>
           <div style={{ fontSize: "12px", opacity: 0.8 }}>
             {isConnected ?
-              `🟢 Online • ${onlineUserCount} users` :
+              `🟢 Online • Real-time connected` :
               "🔴 Connecting..."
             }
           </div>
@@ -495,48 +427,7 @@ export default function Chat() {
           })
         )}
 
-        {/* Typing Indicator */}
-        {typingUsers.length > 0 && (
-          <div style={{
-            display: "flex",
-            justifyContent: "flex-start",
-            marginBottom: "12px"
-          }}>
-            <div style={{
-              backgroundColor: "white",
-              padding: "8px 12px",
-              borderRadius: "18px",
-              boxShadow: "0 1px 2px rgba(0,0,0,0.1)"
-            }}>
-              <div style={{ display: "flex", gap: "4px", alignItems: "center" }}>
-                <div style={{
-                  width: "8px",
-                  height: "8px",
-                  borderRadius: "50%",
-                  backgroundColor: "#999",
-                  animation: "bounce 1.4s infinite ease-in-out both"
-                }} />
-                <div style={{
-                  width: "8px",
-                  height: "8px",
-                  borderRadius: "50%",
-                  backgroundColor: "#999",
-                  animation: "bounce 1.4s infinite ease-in-out both 0.2s"
-                }} />
-                <div style={{
-                  width: "8px",
-                  height: "8px",
-                  borderRadius: "50%",
-                  backgroundColor: "#999",
-                  animation: "bounce 1.4s infinite ease-in-out both 0.4s"
-                }} />
-                <span style={{ fontSize: "12px", color: "#666", marginLeft: "8px" }}>
-                  {typingUsers.join(", ")} typing...
-                </span>
-              </div>
-            </div>
-          </div>
-        )}
+        {/* Typing Indicator removed for Pusher implementation */}
 
         <div ref={messagesEndRef} />
       </div>
